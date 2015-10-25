@@ -1,0 +1,217 @@
+---
+title: "Practical Machine Learning Assignment"
+author: "Alex Hannon"
+date: "25 October 2015"
+output: html_document
+---
+
+# Executive Summary
+In this report I demonstrate the steps taken to create three models to predict the manner in which participants in a study on personal activity monitored using excercise sensors. I show the preprocessing, variable selection, principle component analysis, model creation and finally model selection within the following report, eventually settling on using a Random Forest model, in favour of a slightly weaker Support Machine Vector model. Three datasets are created, a training, test and validation set.
+
+
+# Preprocessing/Exploratory data analysis
+
+Set the working directory and load in the data. Also turned off warnings, as at a later point during the model development stage a number of warnings occur for the Naive Bayes model.
+```{r}
+setwd("/home/alex/Documents/PracticalMachineLearningAssignment")
+set.seed(666)
+#Load the training data
+trainingData <- read.csv("pml-training.csv", header = TRUE, na.strings = c("NA", ""))
+#Load the testing data
+testingData <- read.csv("pml-testing.csv", header = TRUE, na.strings = c("NA", ""))
+options(warn=-1)
+
+```
+
+The dataset contains a large number of variables with little to no data in them, containing NA instead. Here we remove variables with such NA values, and proceed to drop a number of variables relating to the metadata and time. After performing this on the training set we do the same to the test set, which we will refer to as the validation set, from here on, to prevent confusion with our own test set we will create.
+```{r}
+# look at the number of observations and variables
+dim(trainingData)
+dim(testingData)
+
+# remove large number of blank columns
+trainingDataNNA <- trainingData[ , colSums(is.na(trainingData)) == 0]
+dim(trainingDataNNA)
+
+# disregard metadata and time related variables 
+trainingDataNNAIrrelevant <- trainingDataNNA[,-c(1:8)]
+dim(trainingDataNNAIrrelevant)
+
+# do the same to the test set
+validationSet <- testingData[, names(trainingDataNNAIrrelevant[,-52])]
+dim(validationSet)
+```
+
+Next we load the necessary libraries for the rest of the analysis (note some of the packages might not be used, ended up cutting out quite a few plots and whatnot that required them and don't have time to verify which ones I'm using, certain dependencies exist between one or two of the packages and I don't have time to verify which ones are dependent on which. I'm using a proxy version of R that's very fickle about dependencies. )
+```{r}
+library(caret)
+library(ISLR)
+library(ggplot2)
+library(corrplot)
+library(HEAT)
+library(reshape2)
+```
+
+Next we proceed to create a correlation matrix, first changing values to numeric, observing how many variables are in our new dataset, before emitting the classe variable from observation.
+```{r}
+#correlation matrix
+corMatrixPrep <- cor(na.omit(trainingDataNNAIrrelevant[sapply(trainingDataNNAIrrelevant, is.numeric)]))
+dim(corMatrixPrep)
+corMat <- cor(corMatrixPrep[, -51])
+
+```
+
+We create a significance test function to roughly highlight variables that have a low level of correlation, suitable for analysis.
+```{r}
+cor.mtest <- function(mat, conf.level = 0.95) {
+    mat <- as.matrix(mat)
+    n <- ncol(mat)
+    p.mat <- lowCI.mat <- uppCI.mat <- matrix(NA, n, n)
+    diag(p.mat) <- 0
+    diag(lowCI.mat) <- diag(uppCI.mat) <- 1
+    for (i in 1:(n - 1)) {
+        for (j in (i + 1):n) {
+            tmp <- cor.test(mat[, i], mat[, j], conf.level = conf.level)
+            p.mat[i, j] <- p.mat[j, i] <- tmp$p.value
+            lowCI.mat[i, j] <- lowCI.mat[j, i] <- tmp$conf.int[1]
+            uppCI.mat[i, j] <- uppCI.mat[j, i] <- tmp$conf.int[2]
+        }
+    }
+    return(list(p.mat, lowCI.mat, uppCI.mat))
+}
+
+```
+
+Next we create our plot, inputing our preferred significance levels, which will  highlight with X suitable variables for analysis. This only serves to highlight said variables and as a rough guideline as to were clusters of good variables are located.
+```{r}
+res1<-cor.mtest(corMat, 0.95)
+res2<-cor.mtest(corMat, 0.99)
+corrplot(corMat, p.mat = res1[[1]], sig.level = 0.2, order = "FPC", method = "color", 
+         type = "lower", tl.cex = .6, tl.col = rgb(0, 0, 0))
+```
+
+Finally we implement a cutoff point, of 90%, where, if the correlation is over said point, it will be removed from analysis. Finally we observe the number of variables and observations in our test and validation sets
+```{r}
+noCor = findCorrelation(corMatrixPrep, cutoff = .90, verbose = TRUE)
+
+finalTrainingSet <- trainingDataNNAIrrelevant[,-noCor]
+finalValidationSet <- validationSet[, -noCor]
+
+#check number of dimensions in training set
+dim(finalTrainingSet)
+#check number of dimensions in validation set
+dim(finalValidationSet)
+
+```
+# Model Creation
+Now we proceed to create our three models, a random forest, support machine vector and a naive bayes. First however we need to create our training and dataset
+```{r}
+#Create a new test set for work on
+inTrain<-createDataPartition(y=finalTrainingSet$classe, p=0.75,list=FALSE)
+training<-finalTrainingSet[inTrain,] 
+test<-finalTrainingSet[-inTrain,] 
+#check dimensions of test set and number of observations
+dim(test)
+#check dimensions of training set and number of observations
+dim(training)
+```
+
+We then need to perform principle component analysis (admittedly should have done this prior to removing the correlated variables but once more time is an issue). We use the PCA transformations on all three datasets, the training, test and validation sets in order to create allow models to run on all three
+```{r}
+PCATraining <- preProcess(training[, -45], method = "pca", thresh = 0.99)
+PCATrained <- predict(PCATraining, training[, -45])
+PCATEST <- predict(PCATraining, test[, -45])
+PCAValidation <- predict(PCATraining, finalValidationSet[, -45])
+```
+
+##Random Forest
+For our first model we will try the typically high creating a random forest model, using five fold cross-validation
+```{r, cache=TRUE}
+randomForestModel <- train(classe ~ ., method = "rf", data = PCATrained, 
+                           trControl = trainControl(method = "cv", number = 5), 
+                           importance = TRUE)
+
+```
+
+We observe the most significant variables in model creation, notice however that they have been transformed into principle components now. For random forest the significance level is based on the mean decrease in accuracy if the variable were removed, hence these principle components are ranked accordingly.
+```{r}
+varImpPlot(randomForestModel$finalModel, sort = TRUE, type = 1, pch = 18, col = 1, cex = 1,
+           main = "Weight of Principal Components \n for Random Forests")
+
+```
+
+
+##Support Vector Machines
+Next we create our Support Vector Machine, once more using five fold cross validation. 
+```{r, cache=TRUE}
+SVMModel <- train(classe ~ ., data=PCATrained, model="svm", trControl = trainControl(method = "cv", number = 5))
+```
+
+Once more we will observe  the most significant variables in model creation. A crucial difference here however is that the significance level is ranked according to the area over the curve that each principle component occupies, demonstrated by the mean decrease in the Gini statistic.
+```{r}
+#uses ROC to calculate significance
+varImpPlot(SVMModel$finalModel, sort = TRUE,  pch = 5, col = 1, cex = 1,
+           main = "Weight of Principal Components for \n Support Machine Vectors")
+
+```
+
+##Naive Bayes
+Finally we create a Naive Bayes model, using five fold cross validation once more.
+```{r, cache=TRUE}
+naiveModel = train(classe ~., data=PCATrained, method="nb", trControl = trainControl(method = "cv", number = 5))
+```
+
+# Model Selection
+
+In order to select our best model lets sequentially review our three models, before finally comparing all three.
+
+##Random Forest
+Here we create our prediction for the test set we created earlier. Then in order to assess our accuracy and out of sample error rate we perform a simple correlation matrix.
+```{r}
+predictedValuesRF <- predict(randomForestModel, PCATEST)
+confusionMatrix(predictedValuesRF, PCATEST$classe)
+```
+From this we can see our accuracy stand at 98.04%, meaning that we have a roughly 1.96% out of sample error rate to be expected when we apply the model to new data.
+
+##Support Vector Machine
+Again we create our prediction for the test set we created earlier. Then in order to assess our accuracy and out of sample error rate we perform a simple correlation matrix.
+```{r}
+svmPredictions <- predict(SVMModel, PCATEST)
+confusionMatrix(svmPredictions, PCATEST$classe)
+```
+We see a slight decrease in accuracy at 98.1% and as such an out of sample error rate of 1.9%. Whilst this is a slightly less accurate model the difference is only miniscule.
+
+##Naive Bayes
+Finally we create the predictions for the final model for out test set. Then, once more, in order to assess our accuracy and out of sample error rate we perform a simple correlation matrix.
+```{r}
+naivePredictions <- predict(naiveModel, PCATEST)
+confusionMatrix(naivePredictions, PCATEST$classe)
+```
+As we can see the naive bayes model is by far the weakest of the three models, with an accuracy of only 70.04% and as a result 29.96% of an out of sample error rate.
+
+##Review the three models
+
+Finally we create a mask to hold our three different models data in, results, from which we can compare and contrast them
+```{r}
+results <- resamples(list(RF=randomForestModel, SVM=SVMModel, NB=naiveModel))
+summary(results)
+```
+Whilst there is no contest between the rates of accuracy the naive bayes model receives and that of the other two there are some interesting comparisons to be drawn between the Support Machine Vector and the Random Forests. Whilst Random Forests typically perform slightly better overall, Support Machine Vectors typically have higher level of minimum accuracy but lower levels of maximum accuracy. This can further be illistrated though a simple box and dotplot.
+
+```{r}
+bwplot(results)
+dotplot(results)
+```
+
+As can be seen here, overall random forests are somewhat better but Support Machine Vectors are by far more reliable but the differences between them is so small that it makes no real difference in their accuracy. Overall I would recommend the use of the Random Forests Model for its slightly higher prediction accuracy.
+
+Finally, the results of the validation set proved that both the SVM and Random Forest models received 19/20 results correct, proving very little differentiation between the two models. Interestingly the Naive Bayes model was able to correctly answer the one validation set observation (number 3) that the other two got wrong.
+
+```{r}
+answers1 <- predict(randomForestModel, PCAValidation)
+answers1
+answers2 <- predict(SVMModel, PCAValidation)
+answers2
+answers3 <- predict(naiveModel, PCAValidation)
+answers3
+```
